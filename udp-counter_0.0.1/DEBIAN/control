@@ -1,0 +1,7 @@
+Package: udp-counter
+Version: 0.0.1
+Maintainer: Morgan Grieves <fedorovoleg.1999@gmail.com>
+Architecture: all
+Section: admin
+Description: Sniff traffic from network device
+Depends: libc6

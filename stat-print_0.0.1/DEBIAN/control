@@ -1,0 +1,7 @@
+Package: stat-print
+Version: 0.0.1
+Maintainer: Morgan Grieves <fedorovoleg.1999@gmail.com>
+Architecture: all
+Section: admin
+Description: Get statistics from udp-counter
+Depends: libc6

@@ -8,7 +8,7 @@ SRCS=udp_counter.c stat_print.c pac_stat.c
 DBDIR = $(BUILD_DIR)/debug
 DBSRC_UDP_COUNTER = udp_counter.c pac_stat.c
 DBSRC_STAT_PRINT = stat_print.c pac_stat.c
-DBCFLAGS = -g -DDEBUG
+DBCFLAGS = -g -DDEBUG -pg
 
 RELDIR = $(BUILD_DIR)/release
 RELSRC_UDP_COUNTER = udp_counter.c pac_stat.c

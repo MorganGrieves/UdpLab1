@@ -1,13 +1,20 @@
 #include <stdio.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <getopt.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <mqueue.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
 #include <linux/if.h>
 #include <sys/types.h>
+#include <linux/if_packet.h>
 #include <sys/socket.h>
-#include <errno.h>
 #include <netinet/in.h>
 #include <linux/if_ether.h>
 #include <linux/bpf.h>
@@ -15,22 +22,25 @@
 #include <arpa/inet.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
-#include <getopt.h>
-#include <pthread.h>
-#include <stdbool.h>
-#include <mqueue.h>
-#include <signal.h>
-#include <fcntl.h>
+
+#ifdef DEBUG
+#include <time.h>
+#endif
 
 #include "pac_stat.h"
 
 #define COUNTER_QUEUE_NAME_IN  "/udp_counter_queue"
 #define COUNTER_QUEUE_NAME_OUT  "/stat_print"
 
+#define PAC_LIMIT 10000
+
 #define QUEUE_PERMS ((int)(0666))
-#define QUEUE_MAXMSG 126 
+#define QUEUE_MAXMSG 126
 #define QUEUE_MSGSIZE 2048
 #define QUEUE_ATTR_INITIALIZER ((struct mq_attr){0, QUEUE_MAXMSG, QUEUE_MSGSIZE, 0, {0}})
+
+#define MESSAGE_PRIO 1
+#define CLOSE_QUEUE_PRIO 2
 
 enum ipc_method {
     MQ_REQ,
@@ -43,9 +53,13 @@ enum stat_thread {
 };
 
 int sockfd;
+mqd_t mq_in, mq_out;
 int th_pipe_fd[2];
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 struct pac_stat all_pac_stat;
+#ifdef PAC_LIMIT
+clock_t start_time = 0, finish_time = 0;
+#endif
 //флаги выхода из циклов в потоках
 bool th_mq_running = true;
 bool th_sniffer_running = true;
@@ -79,9 +93,21 @@ void exit_all_threads()
 
 void signal_handler(int signum)
 {
+    const char close_str[] = "Close";
 #ifdef DEBUG
     fprintf(stderr, "Stopping threads...\n");
 #endif
+
+    if (mq_send(mq_out, close_str, sizeof(close_str), CLOSE_QUEUE_PRIO) == -1)
+        perror("mq_send");
+
+#ifdef PAC_LIMIT
+    finish_time = clock();
+    fprintf(stderr, "Подсчет производился %f процессорного времени\n", (double)(finish_time - start_time));
+#endif
+    close(STDOUT_FILENO);
+    close(STDIN_FILENO);
+    close(STDERR_FILENO);
     exit_all_threads();
 }
 
@@ -162,8 +188,12 @@ void *first_thread_func()
 
     while (th_sniffer_running) {
         int n = recvfrom(sockfd, buffer, BUFSIZ, 0, NULL, NULL);
-        if (n < 42) {
-            perror("recvfrom():");
+        if (n == -1) {
+            if (errno != EAGAIN) {
+                perror("recvfrom");
+                goto err;
+            }
+
             continue;
         }
 
@@ -175,6 +205,7 @@ void *first_thread_func()
                 ((NULL == ip_dst) || (ip->daddr == ip_dst->s_addr)) &&
                 ((port_src < 0) || (port_src == udp->source)) &&
                 ((port_dst < 0) || (port_dst == udp->dest))) {
+
 #ifdef DEBUG
                 char source_ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &ip->saddr,
@@ -195,6 +226,12 @@ void *first_thread_func()
                         new_pac.pac_mem_num = n;
                         pthread_mutex_lock(&lock);
                         sum_pac_stat(&all_pac_stat, &new_pac);
+#ifdef DEBUG
+                        if (all_pac_stat.pac_counter == PAC_LIMIT) {
+                            finish_time = clock();
+                            kill(getpid(), SIGINT);
+                        }
+#endif
                         pthread_mutex_unlock(&lock);
                         break;
                     case SECOND_STAT_THREAD: ;
@@ -205,7 +242,7 @@ void *first_thread_func()
                                       &pac_data,
                                       sizeof(pac_data));
                         if (bytes == -1 && errno != EAGAIN) {
-                            perror("write:");
+                            perror("write");
                             goto err;
                         }
                         break;
@@ -226,8 +263,9 @@ void *second_thread_func()
 {
     struct mq_attr attr = QUEUE_ATTR_INITIALIZER;
     char buffer[QUEUE_MSGSIZE + 1];
+    unsigned int prio = 0;
 
-    mqd_t mq_in = mq_open(COUNTER_QUEUE_NAME_IN,
+    mq_in = mq_open(COUNTER_QUEUE_NAME_IN,
                           O_CREAT | O_RDONLY | O_NONBLOCK,
                           QUEUE_PERMS,
                           &attr);
@@ -238,7 +276,7 @@ void *second_thread_func()
         return NULL;
     }
 
-    mqd_t mq_out = mq_open(COUNTER_QUEUE_NAME_OUT,
+    mq_out = mq_open(COUNTER_QUEUE_NAME_OUT,
                            O_CREAT | O_WRONLY | O_NONBLOCK,
                            QUEUE_PERMS,
                            &attr);
@@ -256,7 +294,7 @@ void *second_thread_func()
 #endif
 
     while (th_mq_running) {
-        ssize_t bytes_read = mq_receive(mq_in, buffer, QUEUE_MSGSIZE, 0);
+        ssize_t bytes_read = mq_receive(mq_in, buffer, QUEUE_MSGSIZE, &prio);
 
         if (errno != EAGAIN) {
             perror ("mq_receive()");
@@ -274,7 +312,7 @@ void *second_thread_func()
                     if (mq_send(mq_out,
                                 (const char *)&all_pac_stat,
                                 sizeof(all_pac_stat),
-                                0) == -1) {
+                                MESSAGE_PRIO) == -1) {
                         perror("mq_send");
                         goto err;
                     }
@@ -287,7 +325,7 @@ void *second_thread_func()
                     if (mq_send(mq_out,
                                 (const char *)&all_pac_stat,
                                 sizeof(all_pac_stat),
-                                0) == -1) {
+                                MESSAGE_PRIO) == -1) {
                         perror("mq_send");
                         goto err;
                     }
@@ -301,7 +339,13 @@ void *second_thread_func()
 
                 if (bytes > 0) {
                     sum_pac_stat(&all_pac_stat, &pac_data);
-                    printf("Количество пакетов: %lu, суммарное количество байт: %lu\n", all_pac_stat.pac_counter, all_pac_stat.pac_bytes_counter);
+#ifdef DEBUG
+                    if (all_pac_stat.pac_counter == PAC_LIMIT) {
+                        finish_time = clock();
+                        kill(getpid(), SIGINT);
+                    }
+#endif
+//                    printf("Количество пакетов: %lu, суммарное количество байт: %lu\n", all_pac_stat.pac_counter, all_pac_stat.pac_bytes_counter);
                 }
                 break;
         }
@@ -348,11 +392,64 @@ void clean_all()
     free(ip_dst);
 }
 
+int create_device_socket(char *name)
+{
+    struct sockaddr_ll sll = {0};
+    struct ifreq ifr;
+    struct packet_mreq mreq = {0};
+    int ret = 0;
+    int fd = -1;
+
+    if ((fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL))) < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL);
+    flags |= O_NONBLOCK;
+    fcntl(fd, F_SETFL, flags);
+
+    strncpy((char *)ifr.ifr_name, name, IFNAMSIZ);
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) == -1) {
+        perror("Error getting Interface index");
+        ret = -1;
+        goto close_sock;
+    }
+
+    sll.sll_family = AF_PACKET;
+    sll.sll_ifindex = ifr.ifr_ifindex;
+    sll.sll_protocol = htons(ETH_P_ALL);
+
+    if (bind(fd, (const struct sockaddr *)&sll, sizeof(sll)) == -1) {
+        perror("Error binding raw socket to interface");
+        ret = -1;
+        goto close_sock;
+    }
+
+    mreq.mr_ifindex = ifr.ifr_ifindex;
+    mreq.mr_type = PACKET_MR_PROMISC;
+    if (setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == -1) {
+        perror("setsockopt");
+        ret = -1;
+        goto close_sock;
+    }
+
+    goto ret;
+
+close_sock:
+    close(fd);
+
+ret:
+    if (ret == 0)
+        return fd;
+    else
+        return ret;
+}
+
 int main(int argc, char *argv[])
 {
-    struct sigaction sa;
+    struct sigaction sa = {0};
     sa.sa_handler = signal_handler;
-    sa.sa_flags = 0;
 
     sigaction(SIGINT, &sa, NULL);
 
@@ -361,22 +458,11 @@ int main(int argc, char *argv[])
 
     if (parse_opts(argc, argv) < 0) {
         fprintf(stderr, "%s\n", "Invalid argument");
-        goto err_fault;
+        goto ret;
     }
 
-    sockfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (sockfd < 0) {
-        perror("socket");
-        goto err_fault;
-    }
-
-    if (setsockopt(sockfd,
-                   SOL_SOCKET,
-                   SO_BINDTODEVICE,
-                   device_name,
-                   sizeof(device_name))) {
-        perror("setsockopt");
-        goto close_sock;
+    if ((sockfd = create_device_socket(device_name)) == -1) {
+        goto ret;
     }
 
     if (pipe(th_pipe_fd) == -1) {
@@ -389,6 +475,9 @@ int main(int argc, char *argv[])
         goto close_pipes;
     }
 
+#ifdef DEBUG
+    start_time = clock();
+#endif
     if (threads_init() < 0) {
         perror("threads_init");
         goto close_pipes;
@@ -402,10 +491,9 @@ close_pipes:
     close(th_pipe_fd[0]);
     close(th_pipe_fd[1]);
 
-close_sock:
     close(sockfd);
     pthread_mutex_destroy(&lock);
 
-err_fault:
+ret:
     return 0;
 }
